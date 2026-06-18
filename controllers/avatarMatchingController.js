@@ -8,12 +8,10 @@ const AVATARS_DIR = path.resolve(__dirname, '../assets/avatars');
 
 const MATCH_CONFIDENCE_THRESHOLD = 0.80;
 const VISION_MAX_RESULTS = 20;
-const FIREWORKS_POLL_INTERVAL_MS = 3000;
-const FIREWORKS_POLL_MAX_ATTEMPTS = 20;
 
 const GOOGLE_VISION_KEY = process.env.GOOGLE_VISION_KEY;
 const FIREWORKS_API_KEY = process.env.FIREWORKS_API_KEY;
-const FIREWORKS_MODEL = process.env.FIREWORKS_MODEL || 'flux-kontext-pro';
+const FIREWORKS_MODEL = process.env.FIREWORKS_MODEL || 'flux-1-schnell-fp8';
 const FIREWORKS_BASE_URL = 'https://api.fireworks.ai/inference/v1/workflows/accounts/fireworks/models';
 
 // ╔══════════════════════════════════════════════════════════════════╗
@@ -713,83 +711,46 @@ async function generateAvatarFallback(prompt, attrs) {
     return `/static/avatars_generated/${fileName}`;
   }
 
-  // ── Paso 1: Crear solicitud de generación ─────────────────────────────────
-  const createResponse = await axios.post(
-    `${FIREWORKS_BASE_URL}/${FIREWORKS_MODEL}`,
-    { prompt, aspect_ratio: '1:1', output_format: 'png', safety_tolerance: 2, prompt_upsampling: false },
-    { headers: { 'Authorization': `Bearer ${FIREWORKS_API_KEY}`, 'Content-Type': 'application/json', 'Accept': 'application/json' } }
-  );
+  // ── Generación vía Pollinations.ai (gratis, sin API key) ──────────────────
+  // GET devuelve la imagen directamente en el body.
+  const encodedPrompt = encodeURIComponent(prompt);
+  const pollinationsUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=512&height=512&model=flux&nologo=true`;
+  console.info(`[Pollinations] Generando...`);
+  const response = await axios.get(pollinationsUrl, {
+    responseType: 'arraybuffer',
+    validateStatus: s => s < 500,
+    timeout: 90000
+  });
 
-  const requestId = createResponse.data?.request_id;
-  if (!requestId) throw new Error(`Fireworks no retornó request_id: ${JSON.stringify(createResponse.data)}`);
-  console.info(`[Fireworks] Generación iniciada — request_id: ${requestId}`);
-
-  // Esperar 5s (Fireworks tarda en registrar la tarea)
-  await new Promise(r => setTimeout(r, 5000));
-
-  // ── Paso 2: Sondear hasta obtener la imagen ───────────────────────────────
-  const resultUrl = '' + FIREWORKS_BASE_URL + '/' + FIREWORKS_MODEL + '/get_result';
-  const pollHeaders = { 'Authorization': `Bearer ${FIREWORKS_API_KEY}`, 'Content-Type': 'application/json', 'Accept': 'image/png' };
-
-  for (let attempt = 1; attempt <= FIREWORKS_POLL_MAX_ATTEMPTS; attempt++) {
-    await new Promise(r => setTimeout(r, FIREWORKS_POLL_INTERVAL_MS));
-
-    const pollResponse = await axios.post(
-      resultUrl, { id: requestId },
-      { headers: pollHeaders, responseType: 'arraybuffer', validateStatus: s => s < 500 }
-    );
-
-    const httpStatus = pollResponse.status;
-    let responseJson = {};
-    try { responseJson = JSON.parse(Buffer.from(pollResponse.data).toString('utf8')); } catch (_) { }
-
-    const taskStatus = responseJson?.status ?? '';
-    console.info(`[Fireworks] Intento ${attempt}/${FIREWORKS_POLL_MAX_ATTEMPTS} — status: ${taskStatus || httpStatus}`);
-
-    // ── Imagen lista ─────────────────────────────────────────────────────────
-    if (taskStatus === 'Ready' && responseJson?.result) {
-      const imageUrl = responseJson.result?.sample || responseJson.result;
-
-      if (typeof imageUrl === 'string' && imageUrl.startsWith('http')) {
-        console.info(`[Fireworks] Descargando imagen...`);
-        const imgResponse = await axios.get(imageUrl, { responseType: 'arraybuffer' });
-        const buffer = Buffer.from(imgResponse.data);
-        console.info(`[Fireworks] Buffer: ${buffer.length} bytes`);
-
-        // 1. Guardar en historial (avatars_generated/) con nombre descriptivo
-        const generatedDir = process.env.GENERATED_DIR || path.resolve(__dirname, '../assets/avatars_generated');
-        if (!fs.existsSync(generatedDir)) fs.mkdirSync(generatedDir, { recursive: true });
-        const canonicalName = buildCanonicalFileName(attrs);
-        const generatedFileName = `${canonicalName}_${Date.now()}.png`;   // ej: cat_orange_adult_1775123456.png
-        const generatedFilePath = path.join(generatedDir, generatedFileName);
-        fs.writeFileSync(generatedFilePath, buffer);
-        console.info(`[Fireworks] ✅ Historial: ${generatedFilePath}`);
-
-        // 2. Guardar en catálogo para caché (avatars/) — se reutiliza en próximas búsquedas similares
-        const cachePath = path.join(AVATARS_DIR, `${canonicalName}.png`);
-        if (!fs.existsSync(cachePath)) {
-          fs.writeFileSync(cachePath, buffer);
-          console.info(`[Cache] ✅ Catálogo: ${canonicalName}.png — futuras búsquedas usarán esta imagen`);
-        } else {
-          console.info(`[Cache] Ya existe: ${canonicalName}.png — se actualizará con la nueva generación`);
-          fs.writeFileSync(cachePath, buffer);  // actualiza si ya existe, así siempre mejora
-        }
-
-        return `/static/avatars_generated/${generatedFileName}`;
-      }
-    }
-
-    // ── Aún procesando ────────────────────────────────────────────────────────
-    if (taskStatus === 'Pending' || taskStatus === 'Processing' || taskStatus === 'Task not found' || httpStatus === 202) continue;
-
-    if (taskStatus === 'Request Moderated' || taskStatus === 'Content Moderated')
-      throw new Error(`Fireworks moderó: ${taskStatus}`);
-    if (taskStatus === 'Error') throw new Error('Fireworks reportó error en la generación.');
-
-    console.warn(`[Fireworks] Estado desconocido: ${taskStatus} (HTTP ${httpStatus})`);
+  if (response.status !== 200) {
+    let detail = '';
+    try { detail = Buffer.from(response.data).toString('utf8'); } catch (_) { }
+    throw new Error(`Pollinations HTTP ${response.status}: ${detail}`);
   }
 
-  throw new Error(`Fireworks superó tiempo máximo (${FIREWORKS_POLL_MAX_ATTEMPTS} intentos).`);
+  const buffer = Buffer.from(response.data);
+  console.info(`[Pollinations] Buffer: ${buffer.length} bytes`);
+
+  // 1. Guardar en historial (avatars_generated/) con nombre descriptivo
+  const generatedDir = process.env.GENERATED_DIR || path.resolve(__dirname, '../assets/avatars_generated');
+  if (!fs.existsSync(generatedDir)) fs.mkdirSync(generatedDir, { recursive: true });
+  const canonicalName = buildCanonicalFileName(attrs);
+  const generatedFileName = `${canonicalName}_${Date.now()}.png`;
+  const generatedFilePath = path.join(generatedDir, generatedFileName);
+  fs.writeFileSync(generatedFilePath, buffer);
+  console.info(`[Pollinations] ✅ Historial: ${generatedFilePath}`);
+
+  // 2. Guardar en catálogo para caché (avatars/) — se reutiliza en próximas búsquedas similares
+  const cachePath = path.join(AVATARS_DIR, `${canonicalName}.png`);
+  if (!fs.existsSync(cachePath)) {
+    fs.writeFileSync(cachePath, buffer);
+    console.info(`[Cache] ✅ Catálogo: ${canonicalName}.png — futuras búsquedas usarán esta imagen`);
+  } else {
+    console.info(`[Cache] Ya existe: ${canonicalName}.png — se actualizará con la nueva generación`);
+    fs.writeFileSync(cachePath, buffer);
+  }
+
+  return `/static/avatars_generated/${generatedFileName}`;
 }
 
 
